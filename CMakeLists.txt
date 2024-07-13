@@ -443,6 +443,8 @@ set (GLOG_SRCS
   src/demangle.cc
   src/demangle.h
   src/logging.cc
+  src/logging_async.cc
+  src/logging_async.h
   src/raw_logging.cc
   src/symbolize.cc
   src/symbolize.h
@@ -556,6 +558,12 @@ if (BUILD_TESTING)
 
   target_link_libraries (logging_unittest PRIVATE glog)
 
+  add_executable (logging_async_unittest
+    src/logging_async_unittest.cc
+  )
+
+  target_link_libraries (logging_async_unittest PRIVATE glog)
+
   add_executable (stl_logging_unittest
     src/stl_logging_unittest.cc
   )
@@ -625,6 +633,7 @@ if (BUILD_TESTING)
 
   add_test (NAME demangle COMMAND demangle_unittest)
   add_test (NAME logging COMMAND logging_unittest)
+  add_test (NAME logging_async COMMAND logging_async_unittest)
 
   if (TARGET signalhandler_unittest)
     add_test (NAME signalhandler COMMAND signalhandler_unittest)

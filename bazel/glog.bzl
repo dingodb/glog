@@ -24,6 +24,7 @@ def glog_library(namespace='google', with_gflags=1, **kwargs):
             'src/demangle.cc',
             'src/demangle.h',
             'src/logging.cc',
+            'src/logging_async.cc',
             'src/raw_logging.cc',
             'src/signalhandler.cc',
             'src/stacktrace.h',
@@ -45,6 +46,7 @@ def glog_library(namespace='google', with_gflags=1, **kwargs):
             ':stl_logging_h',
             ':vlog_is_on_h',
             'src/glog/log_severity.h',
+            'src/logging_async.h'
         ],
         strip_include_prefix = 'src',
         copts = [

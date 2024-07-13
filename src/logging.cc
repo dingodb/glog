@@ -27,6 +27,39 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+/*
+ *  Copyright (c) 2020 NetEase Inc.
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 #define _GNU_SOURCE 1 // needed for O_NOFOLLOW and pread()/pwrite()
 
 #include "utilities.h"
@@ -62,6 +95,8 @@
 #include "glog/logging.h"
 #include "glog/raw_logging.h"
 #include "base/googleinit.h"
+
+#include "logging_async.h"
 
 #ifdef HAVE_STACKTRACE
 # include "stacktrace.h"
@@ -177,6 +212,12 @@ GLOG_DEFINE_bool(stop_logging_if_full_disk, false,
 
 GLOG_DEFINE_string(log_backtrace_at, "",
                    "Emit a backtrace when logging at file:linenum.");
+
+GLOG_DEFINE_bool(log_async, true, "Enable async logging");
+
+GLOG_DEFINE_int32(log_async_buffer_size_MB, 200, "Asynclogger buffer size in MB");
+
+GLOG_DEFINE_bool(multi_write, false, "Write log to multi-level log file");
 
 // TODO(hamaji): consider windows
 #define PATH_SEPARATOR '/'
@@ -367,7 +408,7 @@ struct LogMessage::LogMessageData  {
 // changing the destination file for log messages of a given severity) also
 // lock this mutex.  Please be sure that anybody who might possibly need to
 // lock it does so.
-static Mutex log_mutex;
+static Mutex* log_mutex = new Mutex();
 
 // Number of messages sent at each severity.  Under log_mutex.
 int64 LogMessage::num_messages_[NUM_SEVERITIES] = {0, 0, 0, 0};
@@ -388,6 +429,33 @@ const char* GetLogSeverityName(LogSeverity severity) {
 
 static bool SendEmailInternal(const char*dest, const char *subject,
                               const char*body, bool use_logging);
+
+const int kTimeBufferSize = 40;
+
+// format tm_time and usecs using iso8601
+static void FormatTimeStr(const struct tm* tm_time, int usecs,
+                          char* time_buf, int len) {
+  // format tm to 2019-12-13T10:31:48+0800
+  strftime(time_buf, len, "%FT%T%z", tm_time);
+
+  char* pos = strchr(time_buf, '+');
+  if (NULL != pos) {
+    // format usecs to .012345
+    char usecs_buf[kTimeBufferSize];
+    snprintf(usecs_buf, sizeof(usecs_buf), ".%06d", usecs);
+
+    int suffix_len = strlen(pos);
+    int usecs_len = strlen(usecs_buf);
+
+    assert(usecs_len > suffix_len);
+    assert(len > strlen(time_buf) + usecs_len);
+
+    // 2019-12-13T10:31:48*******+0800\0
+    memcpy(pos + usecs_len, pos, suffix_len + 1);
+    // 2019-12-13T10:31:48.012345+0800\0
+    memcpy(pos, usecs_buf, usecs_len);
+  }
+}
 
 base::Logger::~Logger() {
 }
@@ -413,10 +481,12 @@ class LogFileObject : public base::Logger {
   // Normal flushing routine
   virtual void Flush();
 
+  void Switch2Child();
+
   // It is the actual file length for the system loggers,
   // i.e., INFO, ERROR, etc.
   virtual uint32 LogSize() {
-    MutexLock l(&lock_);
+    MutexLock l(&locks_[current_]);
     return file_length_;
   }
 
@@ -428,7 +498,7 @@ class LogFileObject : public base::Logger {
  private:
   static const uint32 kRolloverAttemptFrequency = 0x20;
 
-  Mutex lock_;
+  Mutex locks_[2];
   bool base_filename_selected_;
   string base_filename_;
   string symlink_basename_;
@@ -440,6 +510,7 @@ class LogFileObject : public base::Logger {
   uint32 file_length_;
   unsigned int rollover_attempt_;
   int64 next_flush_time_;         // cycle count at which to flush log
+  int current_;
 
   // Actually create a logfile using the value of base_filename_ and the
   // supplied argument time_pid_string
@@ -498,9 +569,13 @@ class LogDestination {
 			      size_t len);
   // Take a log message of a particular severity and log it to a file
   // iff the base filename is not "" (which means "don't log to me")
-  static void MaybeLogToLogfile(LogSeverity severity,
+  // when turn off multiwrite
+  //   logfile_serverity means which log file the message will write to
+  //   real_serverity means the real level of this log message
+  static void MaybeLogToLogfile(LogSeverity logfile_severity,
                                 time_t timestamp,
-				const char* message, size_t len);
+				const char* message, size_t len,
+        LogSeverity real_severity);
   // Take a log message of a particular severity and log it to the file
   // for that severity and also for all files with severity less than
   // this severity.
@@ -537,7 +612,7 @@ class LogDestination {
 
   // Protects the vector sinks_,
   // but not the LogSink objects its elements reference.
-  static Mutex sink_mutex_;
+  static Mutex* sink_mutex_;
 
   // Disallow
   LogDestination(const LogDestination&);
@@ -551,7 +626,7 @@ string LogDestination::addresses_;
 string LogDestination::hostname_;
 
 vector<LogSink*>* LogDestination::sinks_ = NULL;
-Mutex LogDestination::sink_mutex_;
+Mutex* LogDestination::sink_mutex_ = new Mutex();
 bool LogDestination::terminal_supports_color_ = TerminalSupportsColor();
 
 /* static */
@@ -587,7 +662,7 @@ inline void LogDestination::FlushLogFilesUnsafe(int min_severity) {
 inline void LogDestination::FlushLogFiles(int min_severity) {
   // Prevent any subtle race conditions by wrapping a mutex lock around
   // all this stuff.
-  MutexLock l(&log_mutex);
+  MutexLock l(log_mutex);
   for (int i = min_severity; i < NUM_SEVERITIES; i++) {
     LogDestination* log = log_destination(i);
     if (log != NULL) {
@@ -601,7 +676,7 @@ inline void LogDestination::SetLogDestination(LogSeverity severity,
   assert(severity >= 0 && severity < NUM_SEVERITIES);
   // Prevent any subtle race conditions by wrapping a mutex lock around
   // all this stuff.
-  MutexLock l(&log_mutex);
+  MutexLock l(log_mutex);
   log_destination(severity)->fileobject_.SetBasename(base_filename);
 }
 
@@ -609,14 +684,14 @@ inline void LogDestination::SetLogSymlink(LogSeverity severity,
                                           const char* symlink_basename) {
   CHECK_GE(severity, 0);
   CHECK_LT(severity, NUM_SEVERITIES);
-  MutexLock l(&log_mutex);
+  MutexLock l(log_mutex);
   log_destination(severity)->fileobject_.SetSymlinkBasename(symlink_basename);
 }
 
 inline void LogDestination::AddLogSink(LogSink *destination) {
   // Prevent any subtle race conditions by wrapping a mutex lock around
   // all this stuff.
-  MutexLock l(&sink_mutex_);
+  MutexLock l(sink_mutex_);
   if (!sinks_)  sinks_ = new vector<LogSink*>;
   sinks_->push_back(destination);
 }
@@ -624,7 +699,7 @@ inline void LogDestination::AddLogSink(LogSink *destination) {
 inline void LogDestination::RemoveLogSink(LogSink *destination) {
   // Prevent any subtle race conditions by wrapping a mutex lock around
   // all this stuff.
-  MutexLock l(&sink_mutex_);
+  MutexLock l(sink_mutex_);
   // This doesn't keep the sinks in order, but who cares?
   if (sinks_) {
     for (int i = sinks_->size() - 1; i >= 0; i--) {
@@ -640,7 +715,7 @@ inline void LogDestination::RemoveLogSink(LogSink *destination) {
 inline void LogDestination::SetLogFilenameExtension(const char* ext) {
   // Prevent any subtle race conditions by wrapping a mutex lock around
   // all this stuff.
-  MutexLock l(&log_mutex);
+  MutexLock l(log_mutex);
   for ( int severity = 0; severity < NUM_SEVERITIES; ++severity ) {
     log_destination(severity)->fileobject_.SetExtension(ext);
   }
@@ -650,7 +725,7 @@ inline void LogDestination::SetStderrLogging(LogSeverity min_severity) {
   assert(min_severity >= 0 && min_severity < NUM_SEVERITIES);
   // Prevent any subtle race conditions by wrapping a mutex lock around
   // all this stuff.
-  MutexLock l(&log_mutex);
+  MutexLock l(log_mutex);
   FLAGS_stderrthreshold = min_severity;
 }
 
@@ -668,7 +743,7 @@ inline void LogDestination::SetEmailLogging(LogSeverity min_severity,
   assert(min_severity >= 0 && min_severity < NUM_SEVERITIES);
   // Prevent any subtle race conditions by wrapping a mutex lock around
   // all this stuff.
-  MutexLock l(&log_mutex);
+  MutexLock l(log_mutex);
   LogDestination::email_logging_severity_ = min_severity;
   LogDestination::addresses_ = addresses;
 }
@@ -754,12 +829,13 @@ inline void LogDestination::MaybeLogToEmail(LogSeverity severity,
 }
 
 
-inline void LogDestination::MaybeLogToLogfile(LogSeverity severity,
+inline void LogDestination::MaybeLogToLogfile(LogSeverity logfile_severity,
                                               time_t timestamp,
 					      const char* message,
-					      size_t len) {
-  const bool should_flush = severity > FLAGS_logbuflevel;
-  LogDestination* destination = log_destination(severity);
+					      size_t len,
+                LogSeverity real_severity) {
+  const bool should_flush = real_severity > FLAGS_logbuflevel;
+  LogDestination* destination = log_destination(logfile_severity);
   destination->logger_->Write(should_flush, timestamp, message, len);
 }
 
@@ -771,8 +847,13 @@ inline void LogDestination::LogToAllLogfiles(LogSeverity severity,
   if ( FLAGS_logtostderr ) {           // global flag: never log to file
     ColoredWriteToStderr(severity, message, len);
   } else {
-    for (int i = severity; i >= 0; --i)
-      LogDestination::MaybeLogToLogfile(i, timestamp, message, len);
+    if ( FLAGS_multi_write ) {
+      for (int i = severity; i >= 0; --i)
+        LogDestination::MaybeLogToLogfile(i, timestamp, message, len, i);
+    } else {
+      LogDestination::MaybeLogToLogfile(
+        google::INFO, timestamp, message, len, severity);
+    }
   }
 }
 
@@ -783,7 +864,7 @@ inline void LogDestination::LogToSinks(LogSeverity severity,
                                        const struct ::tm* tm_time,
                                        const char* message,
                                        size_t message_len) {
-  ReaderMutexLock l(&sink_mutex_);
+  ReaderMutexLock l(sink_mutex_);
   if (sinks_) {
     for (int i = sinks_->size() - 1; i >= 0; i--) {
       (*sinks_)[i]->send(severity, full_filename, base_filename,
@@ -793,7 +874,7 @@ inline void LogDestination::LogToSinks(LogSeverity severity,
 }
 
 inline void LogDestination::WaitForSinks(LogMessage::LogMessageData* data) {
-  ReaderMutexLock l(&sink_mutex_);
+  ReaderMutexLock l(sink_mutex_);
   if (sinks_) {
     for (int i = sinks_->size() - 1; i >= 0; i--) {
       (*sinks_)[i]->WaitTillSent();
@@ -822,7 +903,7 @@ void LogDestination::DeleteLogDestinations() {
     delete log_destinations_[severity];
     log_destinations_[severity] = NULL;
   }
-  MutexLock l(&sink_mutex_);
+  MutexLock l(sink_mutex_);
   delete sinks_;
   sinks_ = NULL;
 }
@@ -841,13 +922,14 @@ LogFileObject::LogFileObject(LogSeverity severity,
     dropped_mem_length_(0),
     file_length_(0),
     rollover_attempt_(kRolloverAttemptFrequency-1),
-    next_flush_time_(0) {
+    next_flush_time_(0),
+    current_(0) {
   assert(severity >= 0);
   assert(severity < NUM_SEVERITIES);
 }
 
 LogFileObject::~LogFileObject() {
-  MutexLock l(&lock_);
+  MutexLock l(&locks_[current_]);
   if (file_ != NULL) {
     fclose(file_);
     file_ = NULL;
@@ -855,7 +937,7 @@ LogFileObject::~LogFileObject() {
 }
 
 void LogFileObject::SetBasename(const char* basename) {
-  MutexLock l(&lock_);
+  MutexLock l(&locks_[current_]);
   base_filename_selected_ = true;
   if (base_filename_ != basename) {
     // Get rid of old log file since we are changing names
@@ -869,7 +951,7 @@ void LogFileObject::SetBasename(const char* basename) {
 }
 
 void LogFileObject::SetExtension(const char* ext) {
-  MutexLock l(&lock_);
+  MutexLock l(&locks_[current_]);
   if (filename_extension_ != ext) {
     // Get rid of old log file since we are changing names
     if (file_ != NULL) {
@@ -882,13 +964,23 @@ void LogFileObject::SetExtension(const char* ext) {
 }
 
 void LogFileObject::SetSymlinkBasename(const char* symlink_basename) {
-  MutexLock l(&lock_);
+  MutexLock l(&locks_[current_]);
   symlink_basename_ = symlink_basename;
 }
 
 void LogFileObject::Flush() {
-  MutexLock l(&lock_);
+  MutexLock l(&locks_[current_]);
   FlushUnlocked();
+}
+
+// it's only invoked once after switch to child process
+void LogFileObject::Switch2Child() {
+    current_ = 1;
+    bytes_since_flush_ = 0;
+    dropped_mem_length_ = 0;
+    file_length_ = 0;
+    rollover_attempt_ = kRolloverAttemptFrequency - 1;
+    next_flush_time_ = 0;
 }
 
 void LogFileObject::FlushUnlocked(){
@@ -906,7 +998,7 @@ bool LogFileObject::CreateLogfile(const string& time_pid_string) {
   string string_filename = base_filename_+filename_extension_+
                            time_pid_string;
   const char* filename = string_filename.c_str();
-  int fd = open(filename, O_WRONLY | O_CREAT | O_EXCL, FLAGS_logfile_mode);
+  int fd = open(filename, O_WRONLY | O_CREAT | O_APPEND | O_EXCL, FLAGS_logfile_mode);
   if (fd == -1) return false;
 #ifdef HAVE_FCNTL
   // Mark the file close-on-exec. We don't really care if this fails
@@ -965,7 +1057,7 @@ void LogFileObject::Write(bool force_flush,
                           time_t timestamp,
                           const char* message,
                           int message_len) {
-  MutexLock l(&lock_);
+  MutexLock l(&locks_[current_]);
 
   // We don't log if the base_name_ is "" (which means "don't write")
   if (base_filename_selected_ && base_filename_.empty()) {
@@ -1015,9 +1107,9 @@ void LogFileObject::Write(bool force_flush,
     } else {
       // If no base filename for logs of this severity has been set, use a
       // default base filename of
-      // "<program name>.<hostname>.<user name>.log.<severity level>.".  So
+      // "<program name>.log.<severity level>.".  So
       // logfiles will have names like
-      // webserver.examplehost.root.log.INFO.19990817-150000.4354, where
+      // webserver.log.INFO.19990817-150000.4354, where
       // 19990817 is a date (1999 August 17), 150000 is a time (15:00:00),
       // and 4354 is the pid of the logging process.  The date & time reflect
       // when the file was created for output.
@@ -1026,18 +1118,8 @@ void LogFileObject::Write(bool force_flush,
       // "/tmp", and "."
       string stripped_filename(
           glog_internal_namespace_::ProgramInvocationShortName());
-      string hostname;
-      GetHostName(&hostname);
 
-      string uidname = MyUserName();
-      // We should not call CHECK() here because this function can be
-      // called after holding on to log_mutex. We don't want to
-      // attempt to hold on to the same mutex, and get into a
-      // deadlock. Simply use a name like invalid-user.
-      if (uidname.empty()) uidname = "invalid-user";
-
-      stripped_filename = stripped_filename+'.'+hostname+'.'
-                          +uidname+".log."
+      stripped_filename = stripped_filename+".log."
                           +LogSeverityNames[severity_]+'.';
       // We're going to (potentially) try to put logs in several different dirs
       const vector<string> & log_dirs = GetLoggingDirectories();
@@ -1142,7 +1224,7 @@ void LogFileObject::Write(bool force_flush,
 // the data from the first call, we allocate two sets of space.  One
 // for exclusive use by the first thread, and one for shared use by
 // all other threads.
-static Mutex fatal_msg_lock;
+static Mutex* fatal_msg_lock = new Mutex();
 static CrashReason crash_reason;
 static bool fatal_msg_exclusive = true;
 static LogMessage::LogMessageData fatal_msg_data_exclusive;
@@ -1244,7 +1326,7 @@ void LogMessage::Init(const char* file,
 #endif // defined(GLOG_THREAD_LOCAL_STORAGE)
     data_->first_fatal_ = false;
   } else {
-    MutexLock l(&fatal_msg_lock);
+    MutexLock l(fatal_msg_lock);
     if (fatal_msg_exclusive) {
       fatal_msg_exclusive = false;
       data_ = &fatal_msg_data_exclusive;
@@ -1274,18 +1356,15 @@ void LogMessage::Init(const char* file,
   data_->has_been_flushed_ = false;
 
   // If specified, prepend a prefix to each line.  For example:
-  //    I1018 160715 f5d4fbb0 logging.cc:1153]
-  //    (log level, GMT month, date, time, thread_id, file basename, line)
+  //    I 2018-10-18T16:07:15.123456+0800 22222 logging.cc:1152]
+  //    (log level, ISO8601 time format, thread_id, file basename, line)
   // We exclude the thread_id for the default thread.
   if (FLAGS_log_prefix && (line != kNoLogPrefix)) {
+    char timebuf[kTimeBufferSize];
+    FormatTimeStr(&data_->tm_time_, usecs, timebuf, kTimeBufferSize);
     stream() << LogSeverityNames[severity][0]
-             << setw(2) << 1+data_->tm_time_.tm_mon
-             << setw(2) << data_->tm_time_.tm_mday
              << ' '
-             << setw(2) << data_->tm_time_.tm_hour  << ':'
-             << setw(2) << data_->tm_time_.tm_min   << ':'
-             << setw(2) << data_->tm_time_.tm_sec   << "."
-             << setw(6) << usecs
+             << timebuf
              << ' '
              << setfill(' ') << setw(5)
              << static_cast<unsigned int>(GetTID()) << setfill('0')
@@ -1358,9 +1437,21 @@ void LogMessage::Flush() {
   // Prevent any subtle race conditions by wrapping a mutex lock around
   // the actual logging action per se.
   {
-    MutexLock l(&log_mutex);
-    (this->*(data_->send_method_))();
-    ++num_messages_[static_cast<int>(data_->severity_)];
+    if (FLAGS_log_async) {
+      // 此处关闭glog的全局锁
+      // 日志在打入active buffer是加锁的
+      // 后台线程在将日志写入文件时，也会获取日志文件对应的锁
+      // 所以关闭全局锁对日志方面不会产生影响
+      // 但是，如果在运行期间修改日志级别、重设文件保存路径等，会存在延迟的情况
+      // 只要在初始化之后，不调用除打印日志接口之外的函数，不会出现线程安全问题
+      // MutexLock l(log_mutex);
+      (this->*(data_->send_method_))();
+      ++num_messages_[static_cast<int>(data_->severity_)];
+    } else {
+      MutexLock l(log_mutex);
+      (this->*(data_->send_method_))();
+      ++num_messages_[static_cast<int>(data_->severity_)];
+    }
   }
   LogDestination::WaitForSinks(data_);
 
@@ -1405,7 +1496,7 @@ void ReprintFatalMessage() {
 void LogMessage::SendToLog() EXCLUSIVE_LOCKS_REQUIRED(log_mutex) {
   static bool already_warned_before_initgoogle = false;
 
-  log_mutex.AssertHeld();
+  log_mutex->AssertHeld();
 
   RAW_DCHECK(data_->num_chars_to_log_ > 0 &&
              data_->message_text_[data_->num_chars_to_log_-1] == '\n', "");
@@ -1472,9 +1563,13 @@ void LogMessage::SendToLog() EXCLUSIVE_LOCKS_REQUIRED(log_mutex) {
     }
 
     if (!FLAGS_logtostderr) {
-      for (int i = 0; i < NUM_SEVERITIES; ++i) {
-        if ( LogDestination::log_destinations_[i] )
-          LogDestination::log_destinations_[i]->logger_->Write(true, 0, "", 0);
+      if ( FLAGS_multi_write ) {
+        for (int i = 0; i < NUM_SEVERITIES; ++i) {
+          if ( LogDestination::log_destinations_[i] )
+            LogDestination::log_destinations_[i]->logger_->Write(true, 0, "", 0);
+        }
+      } else {
+        LogDestination::log_destinations_[google::INFO]->logger_->Write(true, 0, "", 0);
       }
     }
 
@@ -1483,7 +1578,7 @@ void LogMessage::SendToLog() EXCLUSIVE_LOCKS_REQUIRED(log_mutex) {
     // can use the logging facility. Alternately, we could add
     // an entire unsafe logging interface to bypass locking
     // for signal handlers but this seems simpler.
-    log_mutex.Unlock();
+    log_mutex->Unlock();
     LogDestination::WaitForSinks(data_);
 
     const char* message = "*** Check failure stack trace: ***\n";
@@ -1605,18 +1700,18 @@ void LogMessage::SendToSyslogAndLog() {
 }
 
 base::Logger* base::GetLogger(LogSeverity severity) {
-  MutexLock l(&log_mutex);
+  MutexLock l(log_mutex);
   return LogDestination::log_destination(severity)->logger_;
 }
 
 void base::SetLogger(LogSeverity severity, base::Logger* logger) {
-  MutexLock l(&log_mutex);
+  MutexLock l(log_mutex);
   LogDestination::log_destination(severity)->logger_ = logger;
 }
 
 // L < log_mutex.  Acquires and releases mutex_.
 int64 LogMessage::num_messages(int severity) {
-  MutexLock l(&log_mutex);
+  MutexLock l(log_mutex);
   return num_messages_[severity];
 }
 
@@ -1682,14 +1777,11 @@ string LogSink::ToString(LogSeverity severity, const char* file, int line,
   // so subclasses of LogSink can be updated at the same time.
   int usecs = 0;
 
+  char timebuf[kTimeBufferSize];
+  FormatTimeStr(tm_time, usecs, timebuf, kTimeBufferSize);
   stream << LogSeverityNames[severity][0]
-         << setw(2) << 1+tm_time->tm_mon
-         << setw(2) << tm_time->tm_mday
          << ' '
-         << setw(2) << tm_time->tm_hour << ':'
-         << setw(2) << tm_time->tm_min << ':'
-         << setw(2) << tm_time->tm_sec << '.'
-         << setw(6) << usecs
+         << timebuf
          << ' '
          << setfill(' ') << setw(5) << GetTID() << setfill('0')
          << ' '
@@ -1728,7 +1820,7 @@ namespace internal {
 
 bool GetExitOnDFatal();
 bool GetExitOnDFatal() {
-  MutexLock l(&log_mutex);
+  MutexLock l(log_mutex);
   return exit_on_dfatal;
 }
 
@@ -1744,7 +1836,7 @@ bool GetExitOnDFatal() {
 // these differences are acceptable.
 void SetExitOnDFatal(bool value);
 void SetExitOnDFatal(bool value) {
-  MutexLock l(&log_mutex);
+  MutexLock l(log_mutex);
   exit_on_dfatal = value;
 }
 
@@ -2163,15 +2255,111 @@ void MakeCheckOpValueString(std::ostream* os, const unsigned char& v) {
   }
 }
 
+using SyncLoggerPtr = std::unique_ptr<google::LogFileObject>;
+using AsyncLoggerPtr = std::unique_ptr<google::AsyncLogger>;
+
+static std::vector<AsyncLoggerPtr> g_async_loggers;
+static bool g_logging_inited = false;
+static Mutex g_init_mutex;
+static Mutex* g_cleaer_log_mutex = new Mutex();
+
+void EnableAsyncLogging() {
+  // 默认开启INFO异步日志
+  std::vector<int> asyncLogLevels{google::INFO};
+
+  // 如果写多个日志文件，开启WARNING ERROR的异步日志
+  if (FLAGS_multi_write) {
+    asyncLogLevels.emplace_back(google::WARNING);
+    asyncLogLevels.emplace_back(google::ERROR);
+  }
+
+  // 开启异步日志
+  for (auto level : asyncLogLevels) {
+    // 同步日志
+    SyncLoggerPtr sync_logger(new google::LogFileObject(level, NULL));
+
+    // 异步日志
+    AsyncLoggerPtr logger(new google::AsyncLogger(
+      sync_logger.release(), 1024u * 1024 * FLAGS_log_async_buffer_size_MB));
+
+    g_async_loggers.push_back(std::move(logger));
+    g_async_loggers.back()->Start();
+
+    // 注册异步日志
+    google::base::SetLogger(level, g_async_loggers.back().get());
+  }
+}
+
+// stop所有的AscynLogger，stop会等待日志写入文件后返回
+void FlushAllBuffersOnExit() {
+  MutexLock l(g_cleaer_log_mutex);
+  for (auto& logger : g_async_loggers) {
+    logger->Stop();
+  }
+}
+
+// 捕捉信号后的回调函数
+void FailureWriterWithFlush(const char* data, int size) {
+  FlushAllBuffersOnExit();
+  write(STDERR_FILENO, data, size);
+}
+
+// LOG(FATAL)回调函数
+void FlushAndAbort() {
+  FlushAllBuffersOnExit();
+  abort();
+}
+
 void InitGoogleLogging(const char* argv0) {
+  MutexLock l(&g_init_mutex);
+  if (g_logging_inited) {
+    return;
+  }
+
   glog_internal_namespace_::InitGoogleLoggingUtilities(argv0);
+
+  // 捕捉信号
+  google::InstallFailureSignalHandler();
+
+  // 设置信号回调函数
+  google::InstallFailureWriter(FailureWriterWithFlush);
+
+  // 设置LOG(FATAL)回调
+  google::InstallFailureFunction(FlushAndAbort);
+
+  // 初始化日志保存目录
+  if (FLAGS_log_dir.empty()) {
+    FLAGS_log_dir = "/tmp";
+  }
+
+  auto dirs = google::GetLoggingDirectories();
+  if (dirs.empty() || dirs[0] != FLAGS_log_dir) {
+    fprintf(stderr, "init logging dir error");
+    exit(EXIT_FAILURE);
+  }
+
+  if (!FLAGS_logtostderr && FLAGS_log_async) {
+    EnableAsyncLogging();
+  }
+
+  g_logging_inited = true;
 }
 
 void ShutdownGoogleLogging() {
+  MutexLock l(&g_init_mutex);
+  if (!g_logging_inited) {
+    return;
+  }
+
   glog_internal_namespace_::ShutdownGoogleLoggingUtilities();
+
+  FlushAllBuffersOnExit();
+
   LogDestination::DeleteLogDestinations();
   delete logging_directories_list;
   logging_directories_list = NULL;
+
+  g_logging_inited = false;
 }
 
 _END_GOOGLE_NAMESPACE_
